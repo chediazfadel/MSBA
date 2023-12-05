@@ -1,0 +1,949 @@
+---
+title: "Modeling"
+author: "Che Diaz Fadel"
+date: "2023-11-05"
+output: 
+  html_document:
+    keep_md: true
+    number_sections: no
+    toc: yes
+    fig_width: 15
+    fig_height: 10
+    highlight: tango
+    df_print: paged
+---
+
+# Extreme Gradient Boosting (XGBoost)
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.path = "Modeling_figs/Modeling_")
+
+library(lemon)
+library(tidyverse)
+library(lubridate)
+library(zoo)
+library(fpp3)
+library(caret)
+library(xgboost)
+
+```
+
+## Data Preparation
+
+```{r}
+# get desired column names from EDA
+fixed_cnames <- colnames(read_csv(paste0("../../../mdata/q_data.csv")) %>%
+                           mutate(men_toilet_count = NA,
+                                  .after = self_check_out) %>%
+                           select(-rv_fueling_positions))[c(1:39, 41, 42, 40, 43:52)]
+
+
+q_data <- read_csv(paste0("../../../mdata/qualitative_data_msba.csv")) %>%
+  # Remove row index and duplicated columns
+  select(-c(1, `RV Lanes Fueling Positions`, `Hi-Flow Lanes Fueling Positions`)) %>%
+  # properly encode "None"
+  mutate(
+    across(
+      where(~any(grepl("^N/?A$", ., ignore.case = TRUE))),
+      ~replace(., grepl("^N/?A$", ., ignore.case = TRUE), "None")
+    )
+  ) %>%
+  rename_with(~fixed_cnames) %>%
+  relocate(site_id) %>%
+  # omitting zero-variance variables
+  select(-c(fDoor_count, godfathers_pizza, diesel, car_wash, 
+            ev_charging, non_24_hour, self_check_out))
+
+# Calculate standardized day id
+day_id_df <- tibble(date = seq(as_date("2021-01-01"), as_date("2023-12-31"), "1 day")) %>%
+  # Calculate week_id
+  mutate(week_id = yearweek(date, week_start = 5) %>% format("%V") %>% as.numeric(),
+         # since the first day of fiscal year 2022 is actually in 2021, special logic must be 
+         # applied to identify the beginning of the year
+         x = case_when(lag(week_id, default = 52) == 52 & week_id == 1 ~ 1),
+         year = 2020 + rollapplyr(x, width = n(), FUN = sum, na.rm = TRUE, partial = TRUE)) %>%
+  group_by(year) %>%
+  mutate(day_id = row_number()) %>%
+  select(-x) %>%
+  ungroup()
+
+t_series <- read_csv(paste0("../../../mdata/t_series.csv")) %>%
+  # remove missing store
+  filter(site_id != 23065) %>%
+  relocate(site_id, date) %>%
+  arrange(site_id, date) %>%
+  mutate(id = row_number(),
+         .before = 1) %>%
+  left_join(day_id_df %>%
+              select(date, day_id), "date") %>%
+  group_by(site_id) %>%
+  mutate(first_day_id = first(day_id)) %>%
+  ungroup() %>%
+  arrange(first_day_id, site_id) %>%
+  group_by(site_id) %>%
+  # Encode an alternative day_id which can exist in 2 years
+  mutate(day_id2 = purrr::accumulate(day_id, ~ifelse(.x < .y, .y, .y + 364)),
+         date2 = as_date(as.numeric(as_date("2021-01-01")) + (day_id2 - 1))) %>%
+  ungroup() %>%
+  select(-c(first_day_id))
+
+merged_data <- t_series %>%
+  left_join(q_data,
+            "site_id") %>%
+  arrange(site_id, date)
+```
+
+Maverik expressed the importance of aligning days in a standardized manner, which is why `week_id` is included and why I created a `day_id`.
+
+XGBoost can only handle numeric data. I use dummy variables to handle this.
+
+```{r}
+dummy_targ <- merged_data %>%
+  # get character columns
+  select(where(is.character)) %>%
+  colnames()
+
+# create dummy variables
+dummy_df <- dummyVars(~.,
+                      merged_data %>%
+                        select(all_of(dummy_targ))) %>%
+  predict(merged_data %>%
+            select(all_of(dummy_targ))) %>%
+  as_tibble() %>%
+  # Ensure one level for each column is left out
+  select(!matches("no(ne)?$"), day_of_weekSunday, day_typeWEEKEND, `traditional_forecourt_layoutIn-Line`)
+```
+
+
+Including features derived from an ARIMA model may prove to be helpful in an XGBoost regressor. The innovation residuals and fitted values are calculated for each sales metric for each site.
+
+```{r include = FALSE}
+
+mts_fit <- readRDS("../../../mdata/mts_fit.RDS")
+
+```
+
+
+```{r}
+mts <- merged_data %>%
+  # Convert to wide form
+  pivot_longer(inside_sales:unleaded_sales,
+               names_to = "met",
+               values_to = "sales") %>%
+  # create tsibble grouped on site and sales metric
+  as_tsibble(index = date, key = c(site_id, met))
+```
+
+```{r eval = FALSE}
+# fit arima model
+mts_fit <- mts %>%
+  model(
+    arima = ARIMA(sales, stepwise = FALSE)
+  )
+```
+
+
+```{r}
+# get desired metrics
+mts_aug <- mts_fit %>%
+  augment() %>%
+  as_tibble() %>%
+  pivot_wider(id_cols = c(site_id, date),
+              names_from = met,
+              values_from = c(.fitted, .innov)) %>%
+  # rename output
+  rename_with(~gsub("(\\..*?)_(.*)", "\\2\\1", .),
+              contains("."))
+```
+
+The dummy variables and ARIMA features are incorporated into the model data. Other features were experimented with and omitted in final iterations. XGBoost doesn't handle dates very well so their components need to be split into separate columns.
+
+```{r}
+mdf <- merged_data %>% 
+  arrange(site_id, date) %>%
+  relocate(id, site_id, day_id) %>%
+  relocate(open_year, .after = day_id) %>%
+  # Split dates 
+  mutate(open_month = month(open_date),
+         open_day = day(open_date),
+         .after = open_year) %>% 
+  # join ARIMA features
+  left_join(mts_aug, c("site_id", "date")) %>%
+  mutate(year = year(date),
+         month = month(date),
+         day = day(date),
+         .after = date) %>%
+  group_by(site_id) %>%
+  # include lagged values of the sales features
+  mutate(across(contains("sales"),
+                list(l1 = ~. - lag(.),
+                     l7 = ~. - lag(., 7)))) %>%
+  ungroup() %>%
+  # remove undesired columns
+  select(-c(date, open_date, day_id2, date2, all_of(dummy_targ))) %>%
+  bind_cols(dummy_df)
+```
+
+I decided to hold out entire sites when creating the train test splits so that I can plot entire sales history later on as opposed to random, disjoint dates.
+
+```{r}
+set.seed(1234) 
+train_sites <- sample(unique(mdf$site_id), 30)
+
+
+mdf %>%
+  filter(!site_id %in% train_sites) %>%
+  pivot_longer(inside_sales:unleaded_sales,
+               names_to = "met",
+               values_to = "sales") %>%
+  relocate(met, sales, .after = open_year) %>%
+  ggplot() +
+  geom_line(aes(day_id, sales, color = met)) +
+  facet_rep_wrap(~site_id, repeat.tick.labels = TRUE, scales = "free_y", ncol = 2) +
+  theme_minimal() +
+  theme(legend.position = "top") +
+  labs(title = "Sales history of hold-out sites")
+```
+
+Since predictions need to be made for four separate targets, the appropriates sets have to be defined. XGBoost requires a special class to include in `watchlist` so a separate DMatrix is made for each target variable.
+
+```{r include = FALSE}
+# Train
+train_all <- mdf %>%
+  filter(site_id %in% train_sites)
+
+train_is <- train_all %>%
+  select(-c(id, site_id, inside_sales#, open_year:day
+            ))
+train_fs <- train_all %>%
+  select(-c(id, site_id, food_service_sales, open_year:day, matches("\\.(fitted|innov)$")))
+train_d <- train_all %>%
+  select(-c(id, site_id, diesel_sales, open_year:day, matches("\\.(fitted|innov)$")))
+train_u <- train_all %>%
+  select(-c(id, site_id, unleaded_sales, open_year:day, matches("\\.(fitted|innov)$")))
+
+train_df <- train_all %>%
+  select(-c(id, site_id, inside_sales:unleaded_sales, open_year:day, matches("\\.(fitted|innov)$")))
+
+# Test
+test_all <- mdf %>%
+  filter(!site_id %in% train_sites)
+
+test_is <- test_all %>%
+  select(-c(id, site_id, inside_sales#, open_year:day
+            ))
+test_fs <- test_all %>%
+  select(-c(id, site_id, food_service_sales, open_year:day, matches("\\.(fitted|innov)$")))
+test_d <- test_all %>%
+  select(-c(id, site_id, diesel_sales, open_year:day, matches("\\.(fitted|innov)$")))
+test_u <- test_all %>%
+  select(-c(id, site_id, unleaded_sales, open_year:day, matches("\\.(fitted|innov)$")))
+
+test_df <- test_all  %>%
+  select(-c(id, site_id, inside_sales:unleaded_sales, open_year:day, matches("\\.(fitted|innov)$")))
+
+# Prepare modeling data
+train_dmat_is <- xgb.DMatrix(data = as.matrix(train_df), label = train_all$inside_sales)
+train_dmat_fs <- xgb.DMatrix(data = as.matrix(train_df), label = train_all$food_service_sales)
+train_dmat_d <- xgb.DMatrix(data = as.matrix(train_df), label = train_all$diesel_sales)
+train_dmat_u <- xgb.DMatrix(data = as.matrix(train_df), label = train_all$unleaded_sales)
+
+test_dmat_is <- xgb.DMatrix(data = as.matrix(test_df), label = test_all$inside_sales)
+test_dmat_fs <- xgb.DMatrix(data = as.matrix(test_df), label = test_all$food_service_sales)
+test_dmat_d <- xgb.DMatrix(data = as.matrix(test_df), label = test_all$diesel_sales)
+test_dmat_u <- xgb.DMatrix(data = as.matrix(test_df), label = test_all$unleaded_sales)
+```
+
+
+```{r eval = FALSE}
+# Train
+train_all <- mdf %>%
+  filter(site_id %in% train_sites)
+
+train_is <- train_all %>%
+  select(-c(id, site_id, inside_sales, open_year:day, matches("\\.(fitted|innov)$")))
+train_fs <- train_all %>%
+  select(-c(id, site_id, food_service_sales, open_year:day, matches("\\.(fitted|innov)$")))
+train_d <- train_all %>%
+  select(-c(id, site_id, diesel_sales, open_year:day, matches("\\.(fitted|innov)$")))
+train_u <- train_all %>%
+  select(-c(id, site_id, unleaded_sales, open_year:day, matches("\\.(fitted|innov)$")))
+
+train_df <- train_all %>%
+  select(-c(id, site_id, inside_sales:unleaded_sales, open_year:day, matches("\\.(fitted|innov)$")))
+
+# Test
+test_all <- mdf %>%
+  filter(!site_id %in% train_sites)
+
+test_is <- test_all %>%
+  select(-c(id, site_id, inside_sales, open_year:day, matches("\\.(fitted|innov)$")))
+test_fs <- test_all %>%
+  select(-c(id, site_id, food_service_sales, open_year:day, matches("\\.(fitted|innov)$")))
+test_d <- test_all %>%
+  select(-c(id, site_id, diesel_sales, open_year:day, matches("\\.(fitted|innov)$")))
+test_u <- test_all %>%
+  select(-c(id, site_id, unleaded_sales, open_year:day, matches("\\.(fitted|innov)$")))
+
+test_df <- test_all  %>%
+  select(-c(id, site_id, inside_sales:unleaded_sales, open_year:day, matches("\\.(fitted|innov)$")))
+
+# Prepare modeling data
+train_dmat_is <- xgb.DMatrix(data = as.matrix(train_df), label = train_all$inside_sales)
+train_dmat_fs <- xgb.DMatrix(data = as.matrix(train_df), label = train_all$food_service_sales)
+train_dmat_d <- xgb.DMatrix(data = as.matrix(train_df), label = train_all$diesel_sales)
+train_dmat_u <- xgb.DMatrix(data = as.matrix(train_df), label = train_all$unleaded_sales)
+
+test_dmat_is <- xgb.DMatrix(data = as.matrix(test_df), label = test_all$inside_sales)
+test_dmat_fs <- xgb.DMatrix(data = as.matrix(test_df), label = test_all$food_service_sales)
+test_dmat_d <- xgb.DMatrix(data = as.matrix(test_df), label = test_all$diesel_sales)
+test_dmat_u <- xgb.DMatrix(data = as.matrix(test_df), label = test_all$unleaded_sales)
+```
+
+## Modeling
+
+To decide on a final model, I'll define a tuning grid of 144 hyperparameters to use in 3-fold cross validation. I will implement this first on `inside_sales` and use the best paramters on the other targets.
+
+```{r}
+# Train control
+tc <- trainControl(method = "cv",
+                   # 3-fold cv
+                   number = 3,
+                   allowParallel = FALSE,
+                   returnResamp = "all",
+                   returnData = TRUE,
+                   savePredictions = TRUE)
+
+# Hyperparameters ----
+params <- expand.grid(eta = c(0.05, 0.01),
+                      subsample = c(0.5, 0.8, 1),
+                      gamma = c(2, 5, 7),
+                      max_depth = c(3, 12),
+                      min_child_weight = c(2, 5),
+                      colsample_bytree = c(0.5, 0.9),
+                      nrounds = 1000)
+```
+
+Parallel processing was utilized to save time. Strangely, I repeatedly encountered an error stating "Inconsistent values between `best_tune` and xgb.attr", but only when running on a Mac. This error never occurred when running on a Windows machine. Given the stochastic nature of XGBoost training, the error didn't always occur, and thus in part depended on the random seed. This means that if training was attempted after an error, a valid result may be obtained. I used `tryCatch` in the `foreach` loop to keep trying until a model was trained.
+
+```{r, eval = FALSE}
+# set seed
+set.seed(123)
+# use 9 cores
+cl <- makeForkCluster(8)
+registerDoParallel(cl)
+# record start time
+(xtime1 <- Sys.time())
+
+# Initiate loop
+xgb_par <- foreach(i = 1:nrow(params),
+                   .packages = c("xgboost", "caret", "tidyverse"),
+                   .verbose = TRUE#, .errorhandling = "pass"
+) %dopar% {
+  
+  # foreach doesn't import xgb.DMatrix objects so they must be defined again here
+  train_dmat_is <- xgb.DMatrix(data = as.matrix(train_df), label = train_all$inside_sales)
+  test_dmat_is <- xgb.DMatrix(data = as.matrix(test_df), label = test_all$inside_sales)
+  set.seed(123)  
+  
+  # Initialize failed state
+  xgb_model <- "failed"
+  
+  # keep trying until success
+  while(class(xgb_model) == "character"){
+    xgb_model <- tryCatch({
+      train(
+        x = as.data.frame(train_is),
+        y = train_all$inside_sales,
+        method = "xgbTree",
+        watchlist = list(train = train_dmat_is, test = test_dmat_is),
+        tuneGrid = params[i,],
+        trControl = tc,
+        early_stopping_rounds = 20,
+        verbose = 0
+      )
+    }, error = function(e) {
+      "failed"
+    })
+  }
+  gc()
+  
+  xgb_model
+  
+}
+
+# stop cluster
+stopCluster(cl)
+stopImplicitCluster()
+# record run-time
+xtime2 <- Sys.time()
+xtime2 - xtime1
+gc()
+```
+
+## CV Evaluation
+
+```{r include = FALSE}
+
+xgb_par <- readRDS("../../../mdata/xgb_par_is_mac3.RDS")
+
+```
+
+
+For each model, I make predictions on the test and train set, obtain performance metrics, combine them all into a dataframe, and take the best results based on each metric.
+
+```{r}
+# Evaluate results ----
+tune_res <- lapply(xgb_par,
+                   \(x){
+                     
+                     if("error" %in% class(x)){
+                       tibble()
+                     } else {
+                       train_preds <- predict(x, train_is)
+                       train_res <- postResample(train_preds, train_all$inside_sales) %>%
+                         as.list() %>%
+                         as_tibble() %>%
+                         rename_with(~paste0("train_", .))
+                       
+                       test_preds <- predict(x, test_is)
+                       test_res <- postResample(test_preds, test_all$inside_sales) %>%
+                         as.list() %>%
+                         as_tibble() %>%
+                         rename_with(~paste0("test_", .))
+                       
+                       x$results %>%
+                         as_tibble() %>%
+                         mutate(train_res,
+                                test_res,
+                                train_preds = list(train_preds),
+                                test_preds = list(test_preds))
+                     }
+                     
+                     
+                   }) %>%
+  list_rbind() %>%
+  relocate(eta:nrounds, .after = test_MAE) %>%
+  # determine severity of overfitting by calculating difference between test and train metrics
+  mutate(id = row_number(),
+         rmse_diff = test_RMSE - train_RMSE,
+         rsq_diff = train_Rsquared - test_Rsquared,
+         .before = 1)
+
+head(tune_res)
+
+# Get hyperparameters of best 3 RMSE (cv, train, and test) & Rsquared (cv, train, and test), 
+
+bind_rows(
+  tune_res %>%
+    select(id:Rsquared, train_RMSE, train_Rsquared, test_RMSE, test_Rsquared,
+           eta:colsample_bytree) %>%
+    arrange(RMSE) %>%
+    slice_head(n = 3) %>%
+    mutate(tvar = "RMSE", .before = 1),
+  
+  tune_res %>%
+    select(id:Rsquared, train_RMSE, train_Rsquared, test_RMSE, test_Rsquared,
+           eta:colsample_bytree) %>%
+    arrange(-Rsquared) %>%
+    slice_head(n = 3) %>%
+    mutate(tvar = "Rsqaured", .before = 1),
+  
+  tune_res %>%
+    select(id:Rsquared, train_RMSE, train_Rsquared, test_RMSE, test_Rsquared,
+           eta:colsample_bytree) %>%
+    arrange(test_RMSE) %>%
+    slice_head(n = 3) %>%
+    mutate(tvar = "test_RMSE", .before = 1),
+  
+  tune_res %>%
+    select(id:Rsquared, train_RMSE, train_Rsquared, test_RMSE, test_Rsquared,
+           eta:colsample_bytree) %>%
+    arrange(-test_Rsquared) %>%
+    slice_head(n = 3) %>%
+    mutate(tvar = "test_Rsquared", .before = 1),
+  
+  tune_res %>%
+    select(id:Rsquared, train_RMSE, train_Rsquared, test_RMSE, test_Rsquared,
+           eta:colsample_bytree) %>%
+    arrange(rmse_diff) %>%
+    slice_head(n = 3) %>%
+    mutate(tvar = "rmse_diff", .before = 1),
+  
+  tune_res %>%
+    select(id:Rsquared, train_RMSE, train_Rsquared, test_RMSE, test_Rsquared,
+           eta:colsample_bytree) %>%
+    arrange(rsq_diff) %>%
+    slice_head(n = 3) %>%
+    mutate(tvar = "rsq_diff", .before = 1)
+) 
+
+# Feature importance
+varImp(xgb_par[[22]])
+
+```
+
+Model 22 yielded the best RMSE and Rsquared in CV, so its hyperparamters will be used to predict the remaining sales metrics.
+
+```{r include=FALSE}
+
+# Train
+train_all <- mdf %>%
+  filter(site_id %in% train_sites)
+
+train_is <- train_all %>%
+  select(-c(id, site_id, inside_sales, open_year:day, matches("\\.(fitted|innov)$")))
+train_fs <- train_all %>%
+  select(-c(id, site_id, food_service_sales, open_year:day, matches("\\.(fitted|innov)$")))
+train_d <- train_all %>%
+  select(-c(id, site_id, diesel_sales, open_year:day, matches("\\.(fitted|innov)$")))
+train_u <- train_all %>%
+  select(-c(id, site_id, unleaded_sales, open_year:day, matches("\\.(fitted|innov)$")))
+
+train_df <- train_all %>%
+  select(-c(id, site_id, inside_sales:unleaded_sales, open_year:day, matches("\\.(fitted|innov)$")))
+
+# Test
+test_all <- mdf %>%
+  filter(!site_id %in% train_sites)
+
+test_is <- test_all %>%
+  select(-c(id, site_id, inside_sales, open_year:day, matches("\\.(fitted|innov)$")))
+test_fs <- test_all %>%
+  select(-c(id, site_id, food_service_sales, open_year:day, matches("\\.(fitted|innov)$")))
+test_d <- test_all %>%
+  select(-c(id, site_id, diesel_sales, open_year:day, matches("\\.(fitted|innov)$")))
+test_u <- test_all %>%
+  select(-c(id, site_id, unleaded_sales, open_year:day, matches("\\.(fitted|innov)$")))
+
+test_df <- test_all  %>%
+  select(-c(id, site_id, inside_sales:unleaded_sales, open_year:day, matches("\\.(fitted|innov)$")))
+
+# Prepare modeling data
+train_dmat_is <- xgb.DMatrix(data = as.matrix(train_df), label = train_all$inside_sales)
+train_dmat_fs <- xgb.DMatrix(data = as.matrix(train_df), label = train_all$food_service_sales)
+train_dmat_d <- xgb.DMatrix(data = as.matrix(train_df), label = train_all$diesel_sales)
+train_dmat_u <- xgb.DMatrix(data = as.matrix(train_df), label = train_all$unleaded_sales)
+
+test_dmat_is <- xgb.DMatrix(data = as.matrix(test_df), label = test_all$inside_sales)
+test_dmat_fs <- xgb.DMatrix(data = as.matrix(test_df), label = test_all$food_service_sales)
+test_dmat_d <- xgb.DMatrix(data = as.matrix(test_df), label = test_all$diesel_sales)
+test_dmat_u <- xgb.DMatrix(data = as.matrix(test_df), label = test_all$unleaded_sales)
+
+xgb_fs <- readRDS("../../../mdata/xgb_fs.RDS")
+xgb_d <- readRDS("../../../mdata/xgb_d.RDS")
+xgb_u <- readRDS("../../../mdata/xgb_u.RDS")
+
+```
+
+
+```{r eval = FALSE}
+
+# Food service
+set.seed(123)
+xgb_fs <- "failed"
+
+while(class(xgb_fs) == "character"){
+  xgb_fs <- tryCatch({
+    train(
+      x = as.data.frame(train_fs),
+      y = train_all$inside_sales,
+      method = "xgbTree",
+      watchlist = list(train = train_dmat_fs, test = test_dmat_fs),
+      tuneGrid = params[22,],
+      trControl = tc,
+      early_stopping_rounds = 20,
+      verbose = 0
+    )
+  }, error = function(e) {
+    "failed"
+  })
+}
+
+xgb_fs$results
+
+# Diesel
+xgb_d <- "failed"
+
+while(class(xgb_d) == "character"){
+  xgb_d <- tryCatch({
+    train(
+      x = as.data.frame(train_d),
+      y = train_all$inside_sales,
+      method = "xgbTree",
+      watchlist = list(train = train_dmat_d, test = test_dmat_d),
+      tuneGrid = params[22,],
+      trControl = tc,
+      early_stopping_rounds = 20,
+      verbose = 0
+    )
+  }, error = function(e) {
+    "failed"
+  })
+}
+
+# Unleaded
+xgb_u <- "failed"
+
+while(class(xgb_u) == "character"){
+  xgb_u <- tryCatch({
+    train(
+      x = as.data.frame(train_u),
+      y = train_all$inside_sales,
+      method = "xgbTree",
+      watchlist = list(train = train_dmat_u, test = test_dmat_u),
+      tuneGrid = params[22,],
+      trControl = tc,
+      early_stopping_rounds = 20,
+      verbose = 0
+    )
+  }, error = function(e) {
+    "failed"
+  })
+}
+
+```
+
+
+
+```{r}
+# Food service
+train_pred_fs <- predict(xgb_fs, train_fs)
+test_pred_fs <- predict(xgb_fs, test_fs)
+postResample(train_pred_fs, train_all$food_service_sales)
+postResample(test_pred_fs, test_all$food_service_sales)
+varImp(xgb_fs)
+
+# Diesel
+train_pred_d <- predict(xgb_d, train_d)
+test_pred_d <- predict(xgb_d, test_d)
+postResample(train_pred_d, train_all$diesel_sales)
+postResample(test_pred_d, test_all$diesel_sales)
+varImp(xgb_d)
+
+# Unleaded
+train_pred_u <- predict(xgb_u, train_u)
+test_pred_u <- predict(xgb_u, test_u)
+postResample(train_pred_d, train_all$unleaded_sales)
+postResample(test_pred_d, test_all$unleaded_sales)
+varImp(xgb_u)
+
+```
+
+
+## XGBoost Results
+What works for one sales metric does not necessarily work for the others. While it's very computationally expensive, parameter tuning for each sales metric would likely yield the best results. Not surpisingly, each sales metric is fairly predictive of the others. `men_toilet_count` offered an unexpected contribution which may indicate existence of some other confounding explanatory variable.
+
+# ARIMA/ETS Ensemble
+
+```{r, include = FALSE}
+lapply(names(sessionInfo()$otherPkgs), function(pkgs)
+  detach(
+    paste0('package:', pkgs),
+    character.only = T,
+    unload = T,
+    force = T
+  ))
+```
+
+
+```{r}
+# Load packages 
+library(tidyverse)
+library(lubridate)
+library(zoo)
+library(fpp3)
+library(doParallel)
+library(caret)
+library(xgboost)
+
+```
+
+## Data preparation
+
+```{r}
+# get desired column names from EDA
+fixed_cnames <- colnames(read_csv(paste0("../../../mdata/q_data.csv")) %>%
+                           mutate(men_toilet_count = NA,
+                                  .after = self_check_out) %>%
+                           select(-rv_fueling_positions))[c(1:39, 41, 42, 40, 43:52)]
+
+
+q_data <- read_csv(paste0("../../../mdata/qualitative_data_msba.csv")) %>%
+  # Remove row index and duplicated columns
+  select(-c(1, `RV Lanes Fueling Positions`, `Hi-Flow Lanes Fueling Positions`)) %>%
+  # properly encode "None"
+  mutate(
+    across(
+      where(~any(grepl("^N/?A$", ., ignore.case = TRUE))),
+      ~replace(., grepl("^N/?A$", ., ignore.case = TRUE), "None")
+    )
+  ) %>%
+  rename_with(~fixed_cnames) %>%
+  relocate(site_id) %>%
+  # omitting zero-variance variables
+  select(-c(fDoor_count, godfathers_pizza, diesel, car_wash, 
+            ev_charging, non_24_hour, self_check_out))
+
+# Calculate standardized day id
+day_id_df <- tibble(date = seq(as_date("2021-01-01"), as_date("2023-12-31"), "1 day")) %>%
+  # Calculate week_id
+  mutate(week_id = yearweek(date, week_start = 5) %>% format("%V") %>% as.numeric(),
+         # since the first day of fiscal year 2022 is actually in 2021, special logic must be 
+         # applied to identify the beginning of the year
+         x = case_when(lag(week_id, default = 52) == 52 & week_id == 1 ~ 1),
+         year = 2020 + rollapplyr(x, width = n(), FUN = sum, na.rm = TRUE, partial = TRUE)) %>%
+  group_by(year) %>%
+  mutate(day_id = row_number()) %>%
+  select(-x) %>%
+  ungroup()
+
+t_series <- read_csv(paste0("../../../mdata/t_series.csv")) %>%
+  # remove missing store
+  filter(site_id != 23065) %>%
+  relocate(site_id, date) %>%
+  arrange(site_id, date) %>%
+  mutate(id = row_number(),
+         .before = 1) %>%
+  left_join(day_id_df %>%
+              select(date, day_id), "date") %>%
+  group_by(site_id) %>%
+  mutate(first_day_id = first(day_id)) %>%
+  ungroup() %>%
+  arrange(first_day_id, site_id) %>%
+  group_by(site_id) %>%
+  # Encode an alternative day_id which can exist in 2 years
+  mutate(day_id2 = purrr::accumulate(day_id, ~ifelse(.x < .y, .y, .y + 364)),
+         date2 = as_date(as.numeric(as_date("2021-01-01")) + (day_id2 - 1))) %>%
+  ungroup() %>%
+  select(-c(first_day_id))
+
+merged_data <- t_series %>%
+  # Join time series and qualitative data
+  left_join(q_data,
+            "site_id") %>%
+  arrange(site_id, date) %>%
+  # create observation index variable
+  group_by(site_id) %>%
+  mutate(start_id = row_number(),
+         .before = 2) %>%
+  ungroup()
+
+```
+
+Maverik expressed the importance of aligning days in a standardized manner. `day_id` represents the nth day of a given year. One limitation with `day_id` is that it does not preserve order. For example, if a site opened in the last month of the year, `day_id` 200 actually occurred before `day_id` 20. `day_id2` solves this by allowing the index to span two calendar years.\
+
+I struggled to get the models available in the `fpp3` package to behave as expected when the "index" of a created tsibble was not a native date object, so instead of using `day_id2` as the index in the tsibble, I created `date2` which corresponds directly to `day_id2` but forces the assumption that every site opened in the same year.
+
+## Modeling
+
+The following takes 5 random stores and fits 3 models using data starting from day 1 to day 366. In total, 5,490 models are fitted. The three model types are:\
+
+-   ARIMA\
+-   Regression with ARIMA regressors\
+-   ETS\
+
+This implementation from the `fpp3` package allows for automatic selection of each model's component parts that provide the best fit. While this is a very computationally expensive approach, it is still practical for business implementation. To speed up the process, I've elected to compute in parallel using the `doParallel` package.
+
+```{r eval = FALSE}
+
+# choose 5 random sites
+set.seed(123)
+fe_sites2 <- sample(unique(merged_data$site_id), 5)
+
+# establish 10-core cluster
+cl <- makeCluster(10)
+registerDoParallel(cl)
+(xtime1 <- Sys.time())
+
+# loop over each day
+fit_all <- foreach(i = 1:366,
+                   .packages = c("tidyverse", "fpp3"),
+                   .combine = "bind_rows") %:% 
+  # loop over each sample site
+  foreach(j = fe_sites2,
+          .packages = c("tidyverse", "fpp3"),
+          .combine = "bind_rows")  %dopar%{
+            
+            # subset site and training days
+            ox <- merged_data %>%
+              filter(site_id == j,
+                     start_id <= i) %>%
+              distinct(site_id, day_id, day_id2, .keep_all = TRUE) %>%
+              select(start_id, site_id, day_id, day_id2, date, date2, 
+                     holiday, day_of_week, day_type, ends_with("sales")) %>%
+              # convert to long form
+              pivot_longer(inside_sales:unleaded_sales,
+                           names_to = "tvar",
+                           values_to = "sales") %>%
+              arrange(site_id, tvar, start_id) %>%
+              # create tsibble with appropriate key and index
+              as_tsibble(index = date2, key = c(site_id, tvar)) %>%
+              # define models
+              model(arima1 = ARIMA(sales), # ARIMA
+                    arima2 = ARIMA(sales ~ season("week")), # Regression with ARIAM regressors
+                    ets = ETS(sales)) %>% # ETS
+              # log iteration information
+              mutate(site_id = j,
+                     start_init = i,
+                     .before = 1) %>%
+              mable(key = c(site_id, start_init, tvar), model = c(arima1, arima2, ets))
+            
+            
+            gc()
+            
+            ox
+          }
+
+stopCluster(cl)
+xtime2 <- Sys.time()
+xtime2 - xtime1
+
+# create tsibble of sampled sites in format compatible with fitted models
+base_all <- merged_data %>%
+  filter(site_id %in% fe_sites2) %>%
+  distinct(site_id, day_id, day_id2, .keep_all = TRUE) %>%
+  select(start_id, site_id, day_id, day_id2, date, date2, 
+         holiday, day_of_week, day_type, ends_with("sales")) %>%
+  pivot_longer(inside_sales:unleaded_sales,
+               names_to = "tvar",
+               values_to = "sales") %>%
+  arrange(site_id, tvar, start_id) %>%
+  as_tsibble(index = date2, key = c(site_id, tvar))
+
+# for each site, sales metric, and day, calculate cumulative sales and remaining sales
+ppdf_all <- base_all %>%
+  as_tibble() %>%
+  group_by(site_id, tvar) %>%
+  group_modify(~{
+    lapply(.x$start_id,
+           \(xx){
+             .x %>%
+               group_by(prd = ifelse(start_id <= xx, "pre", "post")) %>%
+               summarise(sales = sum(sales)) %>%
+               mutate(start_id = xx,
+                      .before = 1)
+           }) %>%
+      list_rbind()
+  }) %>%
+  ungroup() %>%
+  pivot_wider(names_from = prd,
+              values_from = sales) %>%
+  mutate(sales = pre + post)
+
+# Make daily forecasts for each site and training start day
+fc_all <- fit_all %>%
+  filter(start_init <= 365) %>%
+  rowwise() %>%
+  group_map(~{
+    si <- .x$start_init
+    
+    .x %>%
+      mable(key = c(site_id, tvar), model = c(arima1, arima2, ets)) %>%
+      forecast(base_all %>%
+                 filter(start_id > si)) %>%
+      left_join(base_all %>%
+                  filter(start_id > si) %>%
+                  select(site_id, date2, sales_obs = sales), c("site_id", "tvar", "date2")) %>%
+      group_by(site_id, .model) %>% 
+      # calculate performance metrics for each site/training start
+      mutate(start_init = si,
+             er = sales_obs - .mean,
+             rmse = RMSE(sales_obs, .mean),
+             mape = MAPE(er, sales_obs)) %>%
+      relocate(start_init, .after = site_id) %>%
+      ungroup()
+    
+  }) %>%
+  list_rbind()
+
+# get total year performance metrics
+fc_all2 <- fc_all %>%
+  filter(!is.na(.mean)) %>% 
+  as_tibble() %>%
+  group_by(tvar, .model, site_id, start_init) %>%
+  # get annual for each sales metric, model, site, training start combination
+  summarise(fc = sum(.mean)) %>%
+  # join cumulative/remaning truth data
+  left_join(ppdf_all %>%
+              select(site_id, tvar, start_init = start_id, 
+                     pre, post, sales),
+            c("site_id", "start_init", "tvar")) %>%
+  mutate(tpred = fc + pre,
+         er = sales - tpred,
+         .after = post) %>%
+  relocate(er, .after = last_col()) %>%
+  group_by(tvar, .model) %>%
+  # aggregate metric for each sales metric and model
+  arrange(tvar, start_init) %>% 
+  mutate(er = sales - tpred,
+         rmse = RMSE(tpred, sales),
+         mae = MAE(tpred, sales),
+         mape = MAPE(er, sales),
+         mape_step = (abs(tpred - sales)/sales) * 100,
+         # get "rolling" RMSE
+         rmse_roll = sapply(start_init,
+                            \(xx){RMSE(tpred[start_init >= xx], sales[start_init >= xx])}),
+         # get "rolling" MAPE
+         mape_roll = sapply(start_init,
+                            \(xx){mean(mape_step[start_init >= xx])}),
+         # get "rolling" MAE
+         mae_roll = sapply(start_init,
+                           \(xx){MAE(tpred[start_init >= xx], sales[start_init >= xx])})
+         
+  ) 
+
+```
+
+
+```{r include = FALSE}
+
+fc_all2 <- readRDS("../../../mdata/fc_all2.RDS")
+
+```
+
+```{r}
+
+fc_all2 %>% 
+  # Select training start day that match Maverik's benchmarks
+  filter(start_init %in% c(14, 21, 183, 300)) %>%
+  ungroup() %>%
+  distinct(tvar, start_init, .model, .keep_all = TRUE) %>%
+  arrange(match(tvar, c("inside_sales", "food_service", "diesel", "unleaded")), start_init, rmse) %>% 
+  select(tvar, start_init, .model, rmse_roll, mape_roll, mae_roll, rmse, mape, mae) %>% 
+  group_by(tvar, start_init) %>%
+  # subset best performing instances
+  filter(rmse_roll == min(rmse_roll) | mape_roll == min(mape_roll)) %>%
+  ungroup() %>%
+  arrange(match(tvar, c("inside_sales", "food_service_sales", "diesel_sales", "unleaded_sales")),
+          start_init) %>%
+  # make output more readable
+  mutate(start_init = case_match(start_init,
+                                 14 ~ "2 weeks",
+                                 21 ~ "3 weeks",
+                                 183 ~ "6 months",
+                                 300 ~ "300 days"),
+         tvar = paste(tvar, start_init)) %>%
+  select(tvar, rmse_roll, mape_roll) %>%
+  # prevent scientific notation output
+  mutate(across(c(rmse_roll, mape_roll), ~as.character(round(., 2)))) %>%
+  filter(!grepl("300", tvar))
+  
+```
+
+
+# Results
+
+We have taken the RMSE value of all the models to compare the model performance. 
+Looking at all the values, we observed that the SVR model performs the best with the given dataset across the different target variables based on final RMSE:\
+-   inside_sales = 0.3448517 \
+-   food_service = 0.2782577\
+-   diesel = 0.567455\
+-   unleaded = 0.8332988\
+
+We have only used the time series data for this model because the qualitative data was not highly co-related while the target variables were co-related within themselves. 
+
+Although SVR yielded the best RMSE, the ARIMA/ETS ensemble outperformed Maverik's benchmarks and possesses much greater versatility and the ability to update models as new data is observed to produce daily forecasts. For these reasons, we recommend Maverik move forward with the ensemble model.
+ 
+While we were able to devise these models,  more data and time would have resulted in better results. There is likely untapped potential in the other models that could be unleashed with more time and experimentation. Some models require massive computational resources to be sure the best parameters are utilised. 
