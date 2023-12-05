@@ -1,5 +1,5 @@
 # **<ins>University of Utah MSBA Capstone</ins>** 
-[![](https://img.shields.io/badge/R-RMarkdown_Notebooks-276DC3?logo=R)](https://github.com/chediazfadel/msba_capstone/tree/main/RMarkdown) [![](https://img.shields.io/badge/R-HTML_Notebooks-276DC3?logo=R)](https://github.com/chediazfadel/msba_capstone/tree/main/HTML)
+[![](https://img.shields.io/badge/R-RMarkdown_Notebooks-276DC3?logo=R)](https://github.com/chediazfadel/MSBA/tree/main/RMarkdown) [![](https://img.shields.io/badge/R-HTML_Notebooks-276DC3?logo=R)](https://github.com/chediazfadel/MSBA/tree/main/HTML)
 
 ## Business Problem and Project Objective
 [Maverik](https://www.maverik.com/) is interested in producing more accurate financial plans and initial ROI documents for future convenience store locations. Considerable uncertainty is associated with deploying new locations in their network and being able to properly allocate resources and accurately predict profitability is crucial to the prosperity of their business. To this end, this project aims to augment veracity of financial plans and ROI documents by leveraging the store-level time series and qualitative data collected by Maverik. This will be done by employing an ensemble of forecasting and supervised regression models designed to provide daily store level sales forecasts of multiple key product categories. Success of this project will be benchmarked against Maverik’s existing Naive forecasting solution and the proposed model will be tuned to minimize:
@@ -33,10 +33,10 @@ While SVR yielded the best RMSE, we were unsuccessful in developing the model's 
 | Diesel 6-month prediction | 26,183 | 3.8% |
 | Unleaded 2-week prediction | 201,561 | 12.6% |
 | Unleaded 3-week prediction | 201,656 | 12.8% |
-| Unleaded 6-month prediction | 27,316 | 2.3.75% |
+| Unleaded 6-month prediction | 27,316 | 3.75% |
 
 ## Personal Contribution
-### EDA [![](https://img.shields.io/badge/R-EDA-276DC3?logo=R)](https://github.com/chediazfadel/msba_capstone/blob/main/EDA-chediazfadel.md)
+### EDA [![](https://img.shields.io/badge/R-EDA-276DC3?logo=R)](https://github.com/chediazfadel/MSBA/blob/main/RMarkdown/EDA%20-%20Che%20Diaz%20Fadel.Rmd)
 
 As well as gaining a greater holistic understanding of the provided data, my EDA aims to answer the following questions:
 
@@ -58,7 +58,7 @@ I found that the data does not have any explicitly `NA` values, but does utilize
 
 The entire data set spans from 2021-01-12 to 2023-08-16 and all 38 stores are present for one year and one day. Given that `open_date` is not uniformly distributed, network-wide seasonality will have to be calculated either on a sales per store basis or by standardizing the date by attributing a day ID similar to `week_id`. Maverik expressed the importance of aligning days in a standardized manner, which is why `week_id` is included. I constructed the standardized `day_id` to ensure the same day was represented similarly across years during modeling.
 
-### Modeling [![](https://img.shields.io/badge/R-Modeling-276DC3?logo=R)](https://github.com/chediazfadel/msba_capstone/blob/main/Modeling-chediazfadel.md)
+### Modeling [![](https://img.shields.io/badge/R-Modeling-276DC3?logo=R)](https://github.com/chediazfadel/MSBA/blob/main/RMarkdown/Modeling_chediazfadel.Rmd)
 
 I elected to train two types of models: **Extreme Gradient Boosting (XGB)** and an **ARIMA/ETS Ensemble**. XGBoost is a very powerful and versatile model that can handle high-dimensionality but often requires a lot of data. While the preliminary results were promising, in the end I was not able to implement the required functionality given the allotted time.
 
