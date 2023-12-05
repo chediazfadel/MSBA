@@ -38,3 +38,6 @@ While SVR yielded the best RMSE, we were unsuccessful in developing the model's 
 ## Personal Contribution
 ### EDA [![](https://img.shields.io/badge/R-EDA-276DC3?logo=R)](https://github.com/chediazfadel/msba_capstone/blob/main/EDA-chediazfadel.md)
 
+- 1 one
+  - 1.1 one dot one
+    - whoa
