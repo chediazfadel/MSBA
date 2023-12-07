@@ -7,8 +7,8 @@
 - Root Mean Squared Error (RMSE)
 - Mean Absolute Percentage Error (MAPE)
 
-Key abilities of the final must include:
-- Calculation of daily level, seasonally sensitive forecast for each of the sales metrics defined by Maverik.
+Key abilities of the final model must include:
+- Calculation of daily level, seasonally sensitive forecasts for each of the sales metrics defined by Maverik.
 - Functionality to create updated forecasts given new data.
 
 The ability to accurately forecast store sales will enable Maverik to optimize the expenditure of scarce resources by pursuing the most profitable locations and minimizing misallocation of said resources when opening a new store. This will lead to better investment, decreased waste, and more reliable financial evaluations.
