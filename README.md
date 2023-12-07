@@ -48,9 +48,9 @@ As well as gaining a greater holistic understanding of the provided data, my EDA
     - Each variable has its own column
     - Each observation has its own row
     - Each value has its own cell
-  - Which features are most correlated with each of the target sales metrics?
-  - What explanatory variables are collinear and how should that be handled?
-  - What affect does seasonality have on the target variables?
+- Which features are most correlated with each of the target sales metrics?
+- What explanatory variables are collinear and how should that be handled?
+- What affect does seasonality have on the target variables?
 
 While my EDA notebook answers all of these questions, I'll mention here two key contributions:
 
